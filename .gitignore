@@ -1,0 +1,19 @@
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Local Data & Token Stores
+tokens_cache.json
+*.pdf
+*.zip
+downloaded_*/
+
+# Environment Secrets
+.env
+.streamlit/secrets.toml
