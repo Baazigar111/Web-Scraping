@@ -1,4 +1,3 @@
-Set-Content -Path README.md -Value @"
 # Odisha RERA Project & Document Explorer
 
 An automated data extraction tool and interactive dashboard for exploring real estate projects, promoter details, land records, and regulatory filings from the Odisha RERA portal.
