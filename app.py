@@ -11,32 +11,12 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 import streamlit as st
-import streamlit.components.v1 as components
 
 st.set_page_config(
     page_title="Odisha RERA Filter & Project Explorer",
     page_icon="🏢",
     layout="wide",
 )
-
-# Run the persistent localStorage hook right at startup to auto-restore tokens across browser sessions
-def sync_tokens_with_local_storage():
-    bridge_html = """
-    <script>
-    (function() {
-        const stored = localStorage.getItem('rera_doc_tokens');
-        const urlParams = new URLSearchParams(window.location.search);
-        
-        if (stored && !urlParams.has('tokens')) {
-            urlParams.set('tokens', stored);
-            window.location.search = urlParams.toString();
-        }
-    })();
-    </script>
-    """
-    components.html(bridge_html, height=0, width=0)
-
-sync_tokens_with_local_storage()
 
 try:
     from dotenv import load_dotenv
@@ -48,6 +28,10 @@ API_HASHING_KEY = os.getenv("API_HASHING_KEY", "22CSMTOOL2022")
 BASE_URL = os.getenv("BASE_URL", "https://reraapps.odisha.gov.in")
 ODISHA_STATE_ID = int(os.getenv("ODISHA_STATE_ID", 21))
 TOKEN_STORE_FILE = os.getenv("TOKEN_STORE_FILE", "tokens_cache.json")
+
+# Upstash Redis REST credentials (free cloud persistence)
+UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").rstrip("/")
+UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 
 STATIC_DISTRICTS = [
     {"id": 354, "name": "Ganjam"},
@@ -95,33 +79,37 @@ http_session.mount("https://", adapter)
 http_session.mount("http://", adapter)
 
 
-# --- Persistent Token Cache (localStorage + URL Sync + Local Disk Fallback) --- #
+# --- Persistent Token Cache (Cloud Redis + Local Fallback) --- #
 def load_saved_tokens() -> dict:
-    tokens = {}
-    # 1. Load from browser URL parameters
-    if "tokens" in st.query_params:
+    # 1. Cloud Persistent Store (survives Render restarts, redeploys, and PC shutdowns)
+    if UPSTASH_URL and UPSTASH_TOKEN:
         try:
-            raw_param = st.query_params["tokens"]
-            decoded = base64.urlsafe_b64decode(raw_param.encode("utf-8")).decode("utf-8")
-            url_tokens = json.loads(decoded)
-            if isinstance(url_tokens, dict):
-                tokens.update(url_tokens)
+            res = requests.get(
+                f"{UPSTASH_URL}/get/rera_tokens",
+                headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
+                timeout=5,
+            )
+            if res.status_code == 200:
+                val = res.json().get("result")
+                if val:
+                    if isinstance(val, str):
+                        return json.loads(val)
+                    elif isinstance(val, dict):
+                        return val
         except Exception:
             pass
 
-    # 2. Load from local container cache if present
+    # 2. Local disk fallback (for local development or when Redis env vars are not set)
     if os.path.exists(TOKEN_STORE_FILE):
         try:
             with open(TOKEN_STORE_FILE, "r", encoding="utf-8") as f:
                 disk_tokens = json.load(f)
                 if isinstance(disk_tokens, dict):
-                    for k, v in disk_tokens.items():
-                        if k not in tokens:
-                            tokens[k] = v
+                    return disk_tokens
         except Exception:
             pass
 
-    return tokens
+    return {}
 
 
 def save_token_to_disk(identifier: str, token: str):
@@ -134,34 +122,24 @@ def save_token_to_disk(identifier: str, token: str):
     elif clean_id in tokens:
         del tokens[clean_id]
 
-    # Save to disk
+    # Save to local file
     try:
         with open(TOKEN_STORE_FILE, "w", encoding="utf-8") as f:
             json.dump(tokens, f, indent=2)
     except Exception:
         pass
 
-    # Sync to browser URL query params
-    encoded_tokens = ""
-    try:
-        encoded_tokens = base64.urlsafe_b64encode(
-            json.dumps(tokens, separators=(",", ":")).encode("utf-8")
-        ).decode("utf-8")
-        st.query_params["tokens"] = encoded_tokens
-    except Exception:
-        pass
-
-    # Sync to browser persistent localStorage
-    if encoded_tokens:
-        components.html(
-            f"""
-            <script>
-                localStorage.setItem('rera_doc_tokens', '{encoded_tokens}');
-            </script>
-            """,
-            height=0,
-            width=0,
-        )
+    # Save to Upstash Cloud Redis permanently
+    if UPSTASH_URL and UPSTASH_TOKEN:
+        try:
+            requests.post(
+                f"{UPSTASH_URL}/set/rera_tokens",
+                headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
+                data=json.dumps(tokens),
+                timeout=5,
+            )
+        except Exception:
+            pass
 
 
 # --- Request Helpers --- #
@@ -240,7 +218,7 @@ def fetch_tahasils(district_id: int):
     return []
 
 
-# --- PDF Downloader & Decryptor (Uncached to ensure instant updates) --- #
+# --- PDF Downloader & Decryptor --- #
 def fetch_pdf_bytes(file_id_or_name: str | int, token_override: str = ""):
     if not file_id_or_name:
         return None
