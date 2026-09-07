@@ -327,6 +327,43 @@ def extract_project_booking_documents(doc_res: dict):
     return docs
 
 
+def extract_overview_documents(prj_data: dict, p_info: dict):
+    docs = []
+    seen_ids = set()
+    saved_tokens = load_saved_tokens()
+
+    def add_item(name, identifier, source):
+        if not identifier or str(identifier) in seen_ids or str(identifier) in ("0", "null", "None"):
+            return
+        str_id = str(identifier).strip()
+        seen_ids.add(str_id)
+        docs.append({
+            "Document Name": name,
+            "Identifier": str_id,
+            "Source": source,
+            "Token": saved_tokens.get(str_id, ""),
+        })
+
+    if isinstance(prj_data, dict):
+        cert_id = p_info.get("certificateCopyId") or prj_data.get("certificateCopyId")
+        if cert_id:
+            add_item("Registration Certificate", cert_id, "Project Details")
+
+        if prj_data.get("estimateCopyDocId"):
+            add_item("Project Cost Estimate Copy", prj_data["estimateCopyDocId"], "Project Details")
+        if prj_data.get("approvedPlanDocId") or prj_data.get("approvalLetterDocId"):
+            add_item("Approved Layout Plan", prj_data.get("approvedPlanDocId") or prj_data.get("approvalLetterDocId"), "Planning Approval")
+        if prj_data.get("commencementCertDocId"):
+            add_item("Commencement Certificate", prj_data["commencementCertDocId"], "Planning Approval")
+
+        if prj_data.get("electricityDocId"):
+            add_item("Electricity Supply NOC", prj_data["electricityDocId"], "Utility NOCs")
+        if prj_data.get("waterDocId"):
+            add_item("Water Supply NOC", prj_data["waterDocId"], "Utility NOCs")
+
+    return docs
+
+
 def extract_all_documents(p_info: dict, sub_data: dict):
     docs = []
     seen_ids = set()
@@ -349,10 +386,10 @@ def extract_all_documents(p_info: dict, sub_data: dict):
     doc_res = sub_data.get("projectDocuments", {})
     prom_details = sub_data.get("promoterDetails", {}).get("result", {})
 
-    # Registration Certificate
-    cert_id = p_info.get("certificateCopyId") or (prj_details.get("certificateCopyId") if isinstance(prj_details, dict) else None)
-    if cert_id:
-        add_doc("Registration Certificate", cert_id, "Project Master")
+    # Registration Certificate & Project Details Docs
+    overview_docs = extract_overview_documents(prj_details, p_info)
+    for ov_doc in overview_docs:
+        add_doc(ov_doc["Document Name"], ov_doc["Identifier"], ov_doc["Source"])
 
     # ProjectBooking Documents
     pdocs = extract_project_booking_documents(doc_res)
@@ -401,15 +438,6 @@ def extract_all_documents(p_info: dict, sub_data: dict):
             add_doc("Project Estimate Copy", fin_data["estimateCopyDocId"], "Financial Details")
         if fin_data.get("documentId"):
             add_doc("Financial Estimate Document", fin_data["documentId"], "Financial Details")
-
-    # Embedded Documents in projectDetails
-    if isinstance(prj_details, dict):
-        if prj_details.get("estimateCopyDocId"):
-            add_doc("Project Estimate Copy", prj_details["estimateCopyDocId"], "Project Overview")
-        if prj_details.get("electricityDocId"):
-            add_doc("Electricity NOC Document", prj_details["electricityDocId"], "Facilities")
-        if prj_details.get("waterDocId"):
-            add_doc("Water Supply NOC Document", prj_details["waterDocId"], "Facilities")
 
     # Professional Certificates
     prof_data = sub_data.get("professionalDetails", {}).get("result", [])
@@ -772,7 +800,22 @@ else:
                 )
 
             with t_overview:
-                st.json(sub_details.get("projectDetails", {}).get("result", {}))
+                st.markdown("#### ℹ️ Project Master Details")
+                st.caption(f"Authority approval, project metadata, and statutory certificates for **{p_name}**")
+
+                prj_res = sub_details.get("projectDetails", {}).get("result", {})
+                overview_docs = extract_overview_documents(prj_res, p)
+
+                if overview_docs:
+                    st.markdown("##### 📄 Attached Approval & Planning Documents")
+                    render_documents_manager(overview_docs, unique_key_prefix=f"pdetails_{p_id}")
+                    st.markdown("---")
+
+                st.markdown("##### 📋 Raw Metadata")
+                if prj_res:
+                    st.json(prj_res)
+                else:
+                    st.info("No project master records reported.")
 
             with t_prom:
                 prom_res = sub_details.get("promoterDetails", {}).get("result", {})
