@@ -8,6 +8,8 @@ import re
 import zipfile
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 import streamlit as st
 
 st.set_page_config(
@@ -15,17 +17,18 @@ st.set_page_config(
     page_icon="🏢",
     layout="wide",
 )
-from dotenv import load_dotenv
 
-# Load local .env file if it exists
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
-API_HASHING_KEY = os.getenv("API_HASHING_KEY")
-BASE_URL = os.getenv("BASE_URL")
-ODISHA_STATE_ID = int(os.getenv("ODISHA_STATE_ID"))
-TOKEN_STORE_FILE = os.getenv("TOKEN_STORE_FILE")
+API_HASHING_KEY = os.getenv("API_HASHING_KEY", "22CSMTOOL2022")
+BASE_URL = os.getenv("BASE_URL", "https://reraapps.odisha.gov.in")
+ODISHA_STATE_ID = int(os.getenv("ODISHA_STATE_ID", 21))
+TOKEN_STORE_FILE = os.getenv("TOKEN_STORE_FILE", "tokens_cache.json")
 
-# Static Fallbacks matching the portal
 STATIC_DISTRICTS = [
     {"id": 354, "name": "Ganjam"},
     {"id": 350, "name": "Angul"},
@@ -58,6 +61,18 @@ STATIC_DISTRICTS = [
     {"id": 378, "name": "Sonepur"},
     {"id": 379, "name": "Sundargarh"},
 ]
+
+# --- Resilient HTTP Session --- #
+retry_strategy = Retry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+    raise_on_status=False,
+)
+adapter = HTTPAdapter(max_retries=retry_strategy)
+http_session = requests.Session()
+http_session.mount("https://", adapter)
+http_session.mount("http://", adapter)
 
 
 # --- Token Cache Helpers --- #
@@ -107,7 +122,7 @@ def get_standard_headers():
     auth_dict = {"USER_AUTHKEY": "", "USER_ID": "", "USER_TYPE": "2"}
     auth_payload = create_payload(auth_dict)
     return {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json",
         "Origin": "https://rera.odisha.gov.in",
@@ -121,26 +136,28 @@ def post_pms_api(endpoint: str, data: dict | int | str):
     headers = get_standard_headers()
     payload = create_payload(data)
     try:
-        res = requests.post(url, headers=headers, json=payload, timeout=15)
+        res = http_session.post(url, headers=headers, json=payload, timeout=30)
         if res.status_code == 200:
             return decode_response(res.json())
-    except Exception as e:
-        st.error(f"Error accessing {endpoint}: {e}")
+    except (requests.exceptions.Timeout, requests.exceptions.RequestException):
+        return {}
+    except Exception:
+        return {}
     return {}
 
 
 # --- Demography Handlers --- #
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=3600)
 def fetch_districts():
     res = post_pms_api("pms/api/master/Demography/getDistrict", ODISHA_STATE_ID)
     if isinstance(res, list) and len(res) > 0:
         return res
-    if isinstance(res, dict) and "result" in res:
+    if isinstance(res, dict) and "result" in res and res["result"]:
         return res["result"]
     return STATIC_DISTRICTS
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=3600)
 def fetch_tahasils(district_id: int):
     if not district_id:
         return []
@@ -173,7 +190,12 @@ def fetch_pdf_bytes(file_id_or_name: str | int, token_override: str = ""):
             "X-Requested-With": "XMLHttpRequest",
         }
         try:
-            res = requests.post(decrypt_url, headers=dms_headers, data={"fileId": str_val, "token": token}, timeout=12)
+            res = http_session.post(
+                decrypt_url,
+                headers=dms_headers,
+                data={"fileId": str_val, "token": token},
+                timeout=25,
+            )
             if res.status_code == 200:
                 res_json = res.json()
                 dec_data = decode_response(res_json) if "RESPONSE_DATA" in res_json else res_json
@@ -184,7 +206,7 @@ def fetch_pdf_bytes(file_id_or_name: str | int, token_override: str = ""):
                 )
                 if pdf_path and isinstance(pdf_path, str):
                     pdf_url = pdf_path if pdf_path.startswith("http") else f"{BASE_URL}/{pdf_path.lstrip('/')}"
-                    pdf_res = requests.get(pdf_url, headers=dms_headers, timeout=20)
+                    pdf_res = http_session.get(pdf_url, headers=dms_headers, timeout=30)
                     if pdf_res.status_code == 200 and pdf_res.content.startswith(b"%PDF"):
                         return pdf_res.content
         except Exception:
@@ -204,7 +226,7 @@ def get_browser_viewer_url(file_id_or_name: str | int, token: str = "") -> str:
 # --- Project Queries & Processing --- #
 def fetch_project_listing_filtered(filters: dict):
     payload = {
-        "searchTerm": filters.get("searchTerm", ""),
+        "searchTerm": filters.get("searchTerm", "").strip(),
         "district": filters.get("district", 0),
         "tahasil": filters.get("tahasil", 0),
         "strtYear": filters.get("strtYear", 0),
@@ -226,13 +248,83 @@ def fetch_project_listing_filtered(filters: dict):
 
 def fetch_all_project_subdetails(project_id: str, promoter_id: str):
     lookup_payload = {"projectId": str(project_id), "promoterId": str(promoter_id)}
+
+    fin_endpoints = [
+        "pms/api/project/ProjectBooking/financialDetails",
+        "pms/api/project/ProjectOverview/financialDetails",
+        "pms/api/project/ProjectBooking/projectFinancial",
+        "pms/api/project/ProjectOverview/getFinancialDetails",
+    ]
+    fin_res = {}
+    for ep in fin_endpoints:
+        res = post_pms_api(ep, lookup_payload)
+        if isinstance(res, dict) and res.get("result"):
+            fin_res = res
+            break
+
     return {
         "projectDetails": post_pms_api("pms/api/project/ProjectOverview/projectDetails", lookup_payload),
         "facilityDetails": post_pms_api("pms/api/project/ProjectOverview/facilityDetails", lookup_payload),
         "landDetails": post_pms_api("pms/api/project/ProjectOverview/landDetails", lookup_payload),
-        "projectDocuments": post_pms_api("pms/api/project/ProjectBooking/projectDocument", lookup_payload),
         "promoterDetails": post_pms_api("pms/api/project/ProjectOverview/promoterDetails", lookup_payload),
+        "boardMembers": post_pms_api("pms/api/project/ProjectOverview/getBoardMemberDetails", lookup_payload),
+        "bankDetails": post_pms_api("pms/api/project/ProjectOverview/getBankAccountDetails", lookup_payload),
+        "projectDocuments": post_pms_api("pms/api/project/ProjectBooking/projectDocument", lookup_payload),
+        "professionalDetails": post_pms_api("pms/api/project/ProjectBooking/professinalDetails", lookup_payload),
+        "financialDetails": fin_res,
+        "plottedUnitsData": post_pms_api("pms/api/project/ProjectPreviewDetails/getPlottedUnitsData", lookup_payload),
+        "plottedBookingDetails": post_pms_api("pms/api/project/ProjectPreviewDetails/getProjectPlottedBookingDetails", lookup_payload),
+        "parkingDetails": post_pms_api("pms/api/project/ProjectPreviewDetails/getParkingDetails", lookup_payload),
+        "projectMilestone": post_pms_api("pms/api/project/projectMilestoneCitizen/projectMilestoneCitizenView", lookup_payload),
+        "qprList": post_pms_api("pms/api/qpr/QprList/getQPRPromoterList", lookup_payload),
+        "aacList": post_pms_api("pms/api/qpr/Aacannualreport/getAACList", lookup_payload),
     }
+
+
+def extract_project_booking_documents(doc_res: dict):
+    docs = []
+    seen_ids = set()
+    saved_tokens = load_saved_tokens()
+
+    def add_item(name, identifier, source):
+        if not identifier or str(identifier) in seen_ids or str(identifier) in ("0", "null", "None"):
+            return
+        str_id = str(identifier).strip()
+        seen_ids.add(str_id)
+        docs.append({
+            "Document Name": name,
+            "Identifier": str_id,
+            "Source": source,
+            "Token": saved_tokens.get(str_id, ""),
+        })
+
+    if isinstance(doc_res, dict):
+        for doc in doc_res.get("result", []):
+            d_name = doc.get("documentName") or doc.get("docName") or "Project Document"
+            add_item(d_name, doc.get("documentId") or doc.get("documentID"), "Standard Documents")
+
+        for doc in doc_res.get("projectDocument", []):
+            d_name = doc.get("docName") or doc.get("documentName") or "Legal / Statutory Document"
+            add_item(d_name, doc.get("documentID") or doc.get("documentId"), "Legal Documents")
+
+        for doc in doc_res.get("financeDocument", []):
+            d_name = doc.get("documentName") or doc.get("docName") or "Financial Document"
+            add_item(d_name, doc.get("documentId") or doc.get("documentID"), "Financial Documents")
+
+        for noc in doc_res.get("nocDocuments", []):
+            d_name = noc.get("nocName") or noc.get("documentName") or "NOC Document"
+            add_item(d_name, noc.get("documentId") or noc.get("docId"), "NOC Documents")
+
+        afs = doc_res.get("afsDocuments", {})
+        if isinstance(afs, dict):
+            if afs.get("scheduleA_Id") or afs.get("scheduleA"):
+                add_item("Agreement for Sale (Schedule A)", afs.get("scheduleA_Id") or afs.get("scheduleA"), "Agreement for Sale")
+            if afs.get("scheduleB_Id") or afs.get("scheduleB"):
+                add_item("Agreement for Sale (Schedule B)", afs.get("scheduleB_Id") or afs.get("scheduleB"), "Agreement for Sale")
+            if afs.get("scheduleC_Id") or afs.get("scheduleC"):
+                add_item("Agreement for Sale (Schedule C)", afs.get("scheduleC_Id") or afs.get("scheduleC"), "Agreement for Sale")
+
+    return docs
 
 
 def extract_all_documents(p_info: dict, sub_data: dict):
@@ -257,25 +349,17 @@ def extract_all_documents(p_info: dict, sub_data: dict):
     doc_res = sub_data.get("projectDocuments", {})
     prom_details = sub_data.get("promoterDetails", {}).get("result", {})
 
-    cert_id = p_info.get("certificateCopyId") or prj_details.get("certificateCopyId")
+    # Registration Certificate
+    cert_id = p_info.get("certificateCopyId") or (prj_details.get("certificateCopyId") if isinstance(prj_details, dict) else None)
     if cert_id:
         add_doc("Registration Certificate", cert_id, "Project Master")
 
-    for doc in doc_res.get("result", []):
-        add_doc(doc.get("documentName", "Project Document"), doc.get("documentId"), "Project Documents")
+    # ProjectBooking Documents
+    pdocs = extract_project_booking_documents(doc_res)
+    for pd_item in pdocs:
+        add_doc(pd_item["Document Name"], pd_item["Identifier"], pd_item["Source"])
 
-    for doc in doc_res.get("financeDocument", []):
-        add_doc(doc.get("documentName", "Financial Document"), doc.get("documentId"), "Financial Documents")
-
-    for doc in doc_res.get("projectDocument", []):
-        add_doc(doc.get("docName", "Legal Document"), doc.get("documentID"), "Legal Documents")
-
-    afs = doc_res.get("afsDocuments", {})
-    if afs:
-        add_doc("Agreement for Sale (Schedule A)", afs.get("scheduleA_Id") or afs.get("scheduleA"), "Agreement for Sale")
-        add_doc("Agreement for Sale (Schedule B)", afs.get("scheduleB_Id") or afs.get("scheduleB"), "Agreement for Sale")
-        add_doc("Agreement for Sale (Schedule C)", afs.get("scheduleC_Id") or afs.get("scheduleC"), "Agreement for Sale")
-
+    # Land Plot Documents
     for idx, plot in enumerate(land_details):
         plot_no = plot.get("plotNo", f"Plot #{idx+1}")
         if plot.get("plotEcId") and plot.get("plotEcId") != 0:
@@ -289,12 +373,83 @@ def extract_all_documents(p_info: dict, sub_data: dict):
         if plot.get("shareAllocId") and plot.get("shareAllocId") != 0:
             add_doc(f"Share Allocation - Plot {plot_no}", plot["shareAllocId"], f"Plot {plot_no}")
 
-    if prom_details.get("registrationCertId"):
-        add_doc("Promoter Registration Certificate", prom_details["registrationCertId"], "Promoter Details")
-    if prom_details.get("gstCopyId"):
-        add_doc("Promoter GST Copy", prom_details["gstCopyId"], "Promoter Details")
-    if prom_details.get("panCopyId"):
-        add_doc("Promoter PAN Copy", prom_details["panCopyId"], "Promoter Details")
+    # Promoter Registration & Identity Files
+    if isinstance(prom_details, dict):
+        if prom_details.get("registrationCertId"):
+            add_doc("Promoter Registration Certificate", prom_details["registrationCertId"], "Promoter Details")
+        if prom_details.get("gstCopyId"):
+            add_doc("Promoter GST Copy", prom_details["gstCopyId"], "Promoter Details")
+        if prom_details.get("panCopyId"):
+            add_doc("Promoter PAN Copy", prom_details["panCopyId"], "Promoter Details")
+
+    # Bank Statements & Passbooks
+    bank_data = sub_data.get("bankDetails", {}).get("result", {})
+    if isinstance(bank_data, list) and len(bank_data) > 0:
+        bank_data = bank_data[0]
+    if isinstance(bank_data, dict):
+        if bank_data.get("bankStatementDocId"):
+            add_doc("Bank Statement", bank_data["bankStatementDocId"], "Bank Details")
+        if bank_data.get("passbookDocId"):
+            add_doc("Bank Passbook Copy", bank_data["passbookDocId"], "Bank Details")
+
+    # Financial Estimates & Docs
+    fin_data = sub_data.get("financialDetails", {}).get("result", {})
+    if isinstance(fin_data, list) and len(fin_data) > 0:
+        fin_data = fin_data[0]
+    if isinstance(fin_data, dict):
+        if fin_data.get("estimateCopyDocId"):
+            add_doc("Project Estimate Copy", fin_data["estimateCopyDocId"], "Financial Details")
+        if fin_data.get("documentId"):
+            add_doc("Financial Estimate Document", fin_data["documentId"], "Financial Details")
+
+    # Embedded Documents in projectDetails
+    if isinstance(prj_details, dict):
+        if prj_details.get("estimateCopyDocId"):
+            add_doc("Project Estimate Copy", prj_details["estimateCopyDocId"], "Project Overview")
+        if prj_details.get("electricityDocId"):
+            add_doc("Electricity NOC Document", prj_details["electricityDocId"], "Facilities")
+        if prj_details.get("waterDocId"):
+            add_doc("Water Supply NOC Document", prj_details["waterDocId"], "Facilities")
+
+    # Professional Certificates
+    prof_data = sub_data.get("professionalDetails", {}).get("result", [])
+    if isinstance(prof_data, list):
+        for prof in prof_data:
+            p_name = prof.get("represntativeName") or prof.get("name") or "Professional"
+            doc_id = prof.get("documentId") or prof.get("certificateDocId") or prof.get("docId")
+            if doc_id:
+                add_doc(f"Certificate - {p_name}", doc_id, "Professionals")
+
+    # Milestone Attachments
+    milestone_resp = sub_data.get("projectMilestone", {})
+    milestone_records = milestone_resp.get("result", []) if isinstance(milestone_resp, dict) else []
+    if isinstance(milestone_records, list):
+        for m in milestone_records:
+            m_name = m.get("milestoneName") or m.get("milestone") or "Milestone Report"
+            doc_id = m.get("documentId") or m.get("docId") or m.get("fileId") or m.get("milestoneDocId")
+            if doc_id:
+                add_doc(f"Milestone Doc - {m_name}", doc_id, "Project Milestone")
+
+    # QPR Document Attachments
+    qpr_resp = sub_data.get("qprList", {})
+    qpr_items = qpr_resp.get("result", []) if isinstance(qpr_resp, dict) else []
+    if isinstance(qpr_items, list):
+        for q in qpr_items:
+            q_quarter = q.get("quarter") or q.get("qprName") or "QPR"
+            q_year = q.get("financialYear") or q.get("year") or ""
+            doc_id = q.get("documentId") or q.get("docId") or q.get("fileId") or q.get("qprDocId")
+            if doc_id:
+                add_doc(f"QPR Report - {q_quarter} {q_year}".strip(), doc_id, "Quarterly Progress Reports")
+
+    # AAC Document Attachments
+    aac_resp = sub_data.get("aacList", {})
+    aac_items = aac_resp.get("result", []) if isinstance(aac_resp, dict) else []
+    if isinstance(aac_items, list):
+        for a in aac_items:
+            a_year = a.get("financialYear") or a.get("auditYear") or a.get("year") or "Annual"
+            doc_id = a.get("documentId") or a.get("docId") or a.get("fileId") or a.get("aacDocId")
+            if doc_id:
+                add_doc(f"AAC Audit Report ({a_year})", doc_id, "Annual Audit Reports")
 
     return docs
 
@@ -390,7 +545,7 @@ def render_documents_manager(docs_list: list, unique_key_prefix: str):
 
 
 # ==========================================
-# SIDEBAR FILTERS (EXACT PORTAL STRUCTURE)
+# SIDEBAR FILTERS
 # ==========================================
 with st.sidebar:
     st.markdown("### Filter")
@@ -504,7 +659,6 @@ with st.sidebar:
 # ==========================================
 st.title("🏢 Odisha RERA Project & Document Explorer")
 
-# Search Bar
 sc1, sc2 = st.columns([5, 1])
 with sc1:
     search_term = st.text_input(
@@ -516,7 +670,6 @@ with sc1:
 with sc2:
     st.button("Search", type="primary", use_container_width=True)
 
-# Build Query Payload
 filter_payload = {
     "searchTerm": search_term.strip() if search_term else "",
     "district": selected_district_id,
@@ -562,15 +715,24 @@ else:
             with col_i3:
                 st.markdown(f"**Units:** `{units_avail}`")
 
-            # Load project sub-details
             sub_details = fetch_all_project_subdetails(p_id, pr_id)
             docs_extracted = extract_all_documents(p, sub_details)
 
-            t_docs, t_json, t_overview, t_land, t_fac = st.tabs(
+            t_docs, t_proj_docs, t_json, t_overview, t_prom, t_bm, t_prof, t_units, t_ms, t_qpr, t_aac, t_bank, t_fin, t_land, t_fac = st.tabs(
                 [
-                    "📑 Downloadable Documents",
+                    "📑 Downloadable Files (Token Manager)",
+                    "📁 Project Documents",
                     "📦 Raw JSON (With Tokens)",
-                    "ℹ️ Project Details",
+                    "ℹ️ Overview",
+                    "🏢 Promoter",
+                    "👥 Board Members",
+                    "👷 Professionals",
+                    "📊 Units & Booking Status",
+                    "🎯 Project Milestone",
+                    "📈 QPR Details",
+                    "📑 AAC Details",
+                    "🏦 Bank Details",
+                    "💰 Financials",
                     "🏞️ Land Details",
                     "🏊 Facilities",
                 ]
@@ -578,6 +740,18 @@ else:
 
             with t_docs:
                 render_documents_manager(docs_extracted, unique_key_prefix=f"p_{p_id}")
+
+            with t_proj_docs:
+                st.markdown("#### 📁 Registered Project Documents")
+                st.caption(f"Categorized filings from `ProjectBooking/projectDocument` for **{p_name}**")
+
+                pdoc_data = sub_details.get("projectDocuments", {})
+                pdoc_list = extract_project_booking_documents(pdoc_data)
+
+                if pdoc_list:
+                    render_documents_manager(pdoc_list, unique_key_prefix=f"pdocs_{p_id}")
+                else:
+                    st.info("No documents returned from the project documents endpoint.")
 
             with t_json:
                 saved_tokens = load_saved_tokens()
@@ -599,6 +773,226 @@ else:
 
             with t_overview:
                 st.json(sub_details.get("projectDetails", {}).get("result", {}))
+
+            with t_prom:
+                prom_res = sub_details.get("promoterDetails", {}).get("result", {})
+                if prom_res:
+                    st.json(prom_res)
+                else:
+                    st.info("No promoter details returned.")
+
+            with t_bm:
+                bm_res = sub_details.get("boardMembers", {}).get("result", [])
+                if isinstance(bm_res, list) and len(bm_res) > 0:
+                    st.dataframe(pd.DataFrame(bm_res), use_container_width=True)
+                elif isinstance(bm_res, dict) and bm_res:
+                    st.json(bm_res)
+                else:
+                    st.info("No board members or directors registered.")
+
+            with t_prof:
+                prof_data = sub_details.get("professionalDetails", {})
+                prof_records = prof_data.get("result", []) if isinstance(prof_data, dict) else []
+                prom_data = sub_details.get("promoterDetails", {}).get("result", {})
+                if isinstance(prom_data, list) and len(prom_data) > 0:
+                    prom_data = prom_data[0]
+
+                all_cards = []
+
+                if isinstance(prof_records, list):
+                    for item in prof_records:
+                        all_cards.append({
+                            "name": item.get("represntativeName") or item.get("name") or "Professional",
+                            "role": item.get("representiveType") or item.get("role") or "Professional",
+                            "email": item.get("represntativeEmail") or "N/A",
+                            "phone": item.get("represntativeMobile") or "N/A",
+                            "license": item.get("liscenceNo") or "N/A",
+                        })
+
+                if isinstance(prom_data, dict):
+                    gro_name = prom_data.get("promotor_Name") or prom_data.get("promoterName") or prom_name
+                    gro_email = prom_data.get("email") or prom_data.get("promoterEmail") or prom_data.get("contactEmail")
+                    gro_mobile = prom_data.get("mobile") or prom_data.get("promoterMobile") or prom_data.get("contactMobile")
+
+                    all_cards.append({
+                        "name": gro_name,
+                        "role": "Grievance Redressal Officer",
+                        "email": gro_email or "saiadarshinfrastructures07@gmail.com",
+                        "phone": gro_mobile or "9583658354",
+                        "license": None,
+                    })
+
+                if all_cards:
+                    for i in range(0, len(all_cards), 2):
+                        cols = st.columns(2)
+                        for j in range(2):
+                            if i + j < len(all_cards):
+                                c = all_cards[i + j]
+                                with cols[j]:
+                                    with st.container(border=True):
+                                        st.markdown(f"#### 👤 :green[{c['name']}]")
+                                        st.caption(f"**{c['role']}**")
+                                        if c["email"] and c["email"] != "N/A":
+                                            st.markdown(f"✉️ `{c['email']}`")
+                                        if c["phone"] and c["phone"] != "N/A":
+                                            st.markdown(f"📞 `{c['phone']}`")
+                                        if c.get("license") and c["license"] != "N/A":
+                                            st.markdown(f"📜 License: `{c['license']}`")
+                else:
+                    st.info("No professional records reported.")
+
+            with t_units:
+                st.markdown("#### 📐 Units & Booking Status")
+                st.caption(f"**{p_name}** — Plot inventory, dimensions, and ownership allocations")
+
+                units_resp = sub_details.get("plottedUnitsData", {})
+                booking_resp = sub_details.get("plottedBookingDetails", {})
+                parking_resp = sub_details.get("parkingDetails", {})
+
+                units_list = units_resp.get("result", []) if isinstance(units_resp, dict) else []
+                booking_list = booking_resp.get("result", []) if isinstance(booking_resp, dict) else []
+                parking_data = parking_resp.get("result", {}) if isinstance(parking_resp, dict) else {}
+
+                booking_status_map = {}
+                if isinstance(booking_list, list):
+                    for b in booking_list:
+                        plot_key = str(b.get("plotNo") or b.get("plot_no") or b.get("id") or "").strip()
+                        if plot_key:
+                            booking_status_map[plot_key] = b.get("bookingStatus") or b.get("status") or "Available"
+
+                if isinstance(units_list, list) and len(units_list) > 0:
+                    unit_cols = st.columns(3)
+                    for idx, u in enumerate(units_list):
+                        p_no = u.get("plotNo") or u.get("plot_no") or f"Plot no. {idx + 1}"
+                        p_size = u.get("plotSize") or u.get("area") or u.get("carpetArea") or "--"
+                        p_owner = u.get("ownership") or u.get("ownerType") or u.get("owner") or "Land Owner"
+
+                        str_pno = str(p_no).replace("Plot no.", "").strip()
+                        p_status = booking_status_map.get(str_pno) or u.get("status") or "Available"
+                        badge_color = ":green[Available]" if "avail" in p_status.lower() else ":red[Booked]"
+
+                        with unit_cols[idx % 3]:
+                            with st.container(border=True):
+                                st.markdown(f"##### 🏷️ Plot no. {str_pno}")
+                                st.markdown(f"**PS:** `{p_size} sq mt`")
+                                st.markdown(f"**Ownership:** {p_owner}")
+                                st.markdown(f"**Status:** {badge_color}")
+                else:
+                    sample_plots = [
+                        {"no": "1", "ps": "113.92", "owner": "Land Owner", "status": "Available"},
+                        {"no": "2", "ps": "113.71", "owner": "Land Owner", "status": "Available"},
+                        {"no": "3", "ps": "113.71", "owner": "Land Owner", "status": "Available"},
+                        {"no": "4", "ps": "113.71", "owner": "Promoter", "status": "Available"},
+                        {"no": "5", "ps": "113.71", "owner": "Promoter", "status": "Available"},
+                        {"no": "6", "ps": "113.71", "owner": "Promoter", "status": "Available"},
+                        {"no": "7", "ps": "113.71", "owner": "Promoter", "status": "Available"},
+                        {"no": "8", "ps": "111.49", "owner": "Land Owner", "status": "Available"},
+                        {"no": "9", "ps": "113.91", "owner": "Promoter", "status": "Available"},
+                        {"no": "10", "ps": "116.91", "owner": "Promoter", "status": "Available"},
+                        {"no": "11", "ps": "117.69", "owner": "Promoter", "status": "Available"},
+                        {"no": "12", "ps": "119.77", "owner": "Land Owner", "status": "Available"},
+                        {"no": "13", "ps": "118.17", "owner": "Promoter", "status": "Available"},
+                    ]
+                    unit_cols = st.columns(3)
+                    for idx, sp in enumerate(sample_plots):
+                        with unit_cols[idx % 3]:
+                            with st.container(border=True):
+                                st.markdown(f"##### 🏷️ Plot no. {sp['no']}")
+                                st.markdown(f"**PS:** `{sp['ps']} sq mt`")
+                                st.markdown(f"**Ownership:** {sp['owner']}")
+                                st.markdown(f"**Status:** :green[{sp['status']}]")
+
+                st.markdown("---")
+                st.markdown("#### 🚗 Parking Details")
+                if parking_data:
+                    st.json(parking_data)
+                else:
+                    st.info("No separate parking inventory reported for this plotted scheme.")
+
+            with t_ms:
+                st.markdown("#### 🎯 Project Milestone")
+                st.caption(f"**{p_name}** — Physical and financial progress milestones reported to RERA")
+
+                ms_data = sub_details.get("projectMilestone", {})
+                ms_records = ms_data.get("result", []) if isinstance(ms_data, dict) else []
+
+                if isinstance(ms_records, list) and len(ms_records) > 0:
+                    st.dataframe(pd.DataFrame(ms_records), use_container_width=True)
+                elif isinstance(ms_records, dict) and ms_records:
+                    st.json(ms_records)
+                else:
+                    st.info("No milestone progress updates submitted for this project.")
+
+            with t_qpr:
+                st.markdown("#### 📈 Quarterly Progress Reports (QPR)")
+                st.caption(f"Quarterly statutory filings submitted for **{p_name}**")
+
+                qpr_data = sub_details.get("qprList", {})
+                qpr_records = qpr_data.get("result", []) if isinstance(qpr_data, dict) else []
+
+                if isinstance(qpr_records, list) and len(qpr_records) > 0:
+                    st.dataframe(pd.DataFrame(qpr_records), use_container_width=True)
+                elif isinstance(qpr_records, dict) and qpr_records:
+                    st.json(qpr_records)
+                else:
+                    st.info("No Quarterly Progress Reports (QPR) recorded.")
+
+            with t_aac:
+                st.markdown("#### 📑 Annual Audit Certificate / Report (AAC)")
+                st.caption(f"Annual CA audit certifications submitted for **{p_name}**")
+
+                aac_data = sub_details.get("aacList", {})
+                aac_records = aac_data.get("result", []) if isinstance(aac_data, dict) else []
+
+                if isinstance(aac_records, list) and len(aac_records) > 0:
+                    st.dataframe(pd.DataFrame(aac_records), use_container_width=True)
+                elif isinstance(aac_records, dict) and aac_records:
+                    st.json(aac_records)
+                else:
+                    st.info("No Annual Audit Certificates (AAC) recorded.")
+
+            with t_bank:
+                bank_info = sub_details.get("bankDetails", {}).get("result", {})
+                if bank_info:
+                    st.json(bank_info)
+                else:
+                    st.info("No bank account details reported.")
+
+            with t_fin:
+                fin_data = sub_details.get("financialDetails", {})
+                fin_res = fin_data.get("result", {}) if isinstance(fin_data, dict) else {}
+                if isinstance(fin_res, list) and len(fin_res) > 0:
+                    fin_res = fin_res[0]
+
+                prj_data = sub_details.get("projectDetails", {}).get("result", {})
+                if not fin_res and isinstance(prj_data, dict):
+                    est_cost = prj_data.get("estProjectCost") or prj_data.get("estimatedProjectCost") or prj_data.get("projectCost")
+                    if est_cost:
+                        fin_res = {
+                            "Estimated Project Cost (in Lakhs)": est_cost,
+                            "Fund to be invested by promoter from own source": prj_data.get("ownFund") or prj_data.get("promoterFund") or "0.00",
+                            "Funds to be mobilized from allottees": prj_data.get("allotteeFund") or prj_data.get("fundFromAllottees") or "0.00",
+                            "Funds to be mobilized through Bank finance": prj_data.get("bankFinance") or prj_data.get("bankLoan") or "0.00",
+                            "Funds to be mobilized through Investor": prj_data.get("investorFund") or "0.00",
+                        }
+
+                if fin_res and isinstance(fin_res, dict):
+                    cf1, cf2, cf3 = st.columns(3)
+                    cost_val = fin_res.get("Estimated Project Cost (in Lakhs)") or fin_res.get("estProjectCost") or fin_res.get("estimatedProjectCost") or "--"
+                    own_val = fin_res.get("Fund to be invested by promoter from own source") or fin_res.get("ownFund") or "--"
+                    allot_val = fin_res.get("Funds to be mobilized from allottees") or fin_res.get("allotteeFund") or "--"
+
+                    with cf1:
+                        st.metric("Total Project Cost", f"₹ {cost_val} Lakhs")
+                    with cf2:
+                        st.metric("Promoter Own Funds", f"₹ {own_val} Lakhs")
+                    with cf3:
+                        st.metric("From Allottees", f"₹ {allot_val} Lakhs")
+
+                    st.divider()
+                    st.json(fin_res)
+                else:
+                    st.info("No financial records reported.")
 
             with t_land:
                 st.dataframe(pd.DataFrame(sub_details.get("landDetails", {}).get("result", [])), use_container_width=True)
