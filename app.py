@@ -29,7 +29,6 @@ BASE_URL = os.getenv("BASE_URL", "https://reraapps.odisha.gov.in")
 ODISHA_STATE_ID = int(os.getenv("ODISHA_STATE_ID", 21))
 TOKEN_STORE_FILE = os.getenv("TOKEN_STORE_FILE", "tokens_cache.json")
 
-# Upstash Redis REST credentials (free cloud persistence)
 UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").rstrip("/")
 UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 
@@ -81,7 +80,7 @@ http_session.mount("http://", adapter)
 
 # --- Persistent Token Cache (Cloud Redis + Local Fallback) --- #
 def load_saved_tokens() -> dict:
-    # 1. Cloud Persistent Store (survives Render restarts, redeploys, and PC shutdowns)
+    # 1. Cloud Persistent Store via Upstash Redis REST
     if UPSTASH_URL and UPSTASH_TOKEN:
         try:
             res = requests.get(
@@ -90,16 +89,19 @@ def load_saved_tokens() -> dict:
                 timeout=5,
             )
             if res.status_code == 200:
-                val = res.json().get("result")
-                if val:
-                    if isinstance(val, str):
-                        return json.loads(val)
-                    elif isinstance(val, dict):
-                        return val
+                raw_val = res.json().get("result")
+                if raw_val:
+                    if isinstance(raw_val, str):
+                        try:
+                            return json.loads(raw_val)
+                        except json.JSONDecodeError:
+                            return {}
+                    elif isinstance(raw_val, dict):
+                        return raw_val
         except Exception:
             pass
 
-    # 2. Local disk fallback (for local development or when Redis env vars are not set)
+    # 2. Local disk fallback
     if os.path.exists(TOKEN_STORE_FILE):
         try:
             with open(TOKEN_STORE_FILE, "r", encoding="utf-8") as f:
@@ -542,14 +544,10 @@ def render_documents_manager(docs_list: list, unique_key_prefix: str):
 
     saved_tokens = load_saved_tokens()
 
+    # Pre-sync document tokens with database values
     for doc in docs_list:
         ident = str(doc["Identifier"]).strip()
-        state_key = f"tok_{unique_key_prefix}_{ident}"
-        cached_tok = saved_tokens.get(ident, "")
-        if state_key in st.session_state and st.session_state[state_key].strip():
-            doc["Token"] = st.session_state[state_key].strip()
-        elif cached_tok:
-            doc["Token"] = cached_tok
+        doc["Token"] = saved_tokens.get(ident, "").strip()
 
     ready_count = sum(1 for d in docs_list if d.get("Token", "").strip())
 
@@ -576,7 +574,7 @@ def render_documents_manager(docs_list: list, unique_key_prefix: str):
         identifier = str(doc["Identifier"]).strip()
         source = doc["Source"]
         state_key = f"tok_{unique_key_prefix}_{identifier}"
-        current_token = doc.get("Token", "").strip()
+        current_token = doc.get("Token", "")
 
         col_name, col_token, col_link, col_dl = st.columns([4, 3, 2, 2])
 
@@ -585,18 +583,19 @@ def render_documents_manager(docs_list: list, unique_key_prefix: str):
             st.caption(f"ID: `{identifier}` | Source: *{source}*")
 
         with col_token:
+            if state_key not in st.session_state:
+                st.session_state[state_key] = current_token
+
             token_input = st.text_input(
                 label=f"Token for {identifier}",
-                value=current_token,
-                placeholder="Paste token (&text=...)",
                 key=state_key,
+                placeholder="Paste token (&text=...)",
                 label_visibility="collapsed",
             )
 
-            if token_input.strip() and token_input.strip() != current_token:
-                clean_tok = token_input.strip()
-                save_token_to_disk(identifier, clean_tok)
-                doc["Token"] = clean_tok
+            # Detect manual input changes and immediately save to Upstash & Disk
+            if token_input.strip() != current_token:
+                save_token_to_disk(identifier, token_input.strip())
                 st.rerun()
 
         with col_link:
