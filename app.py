@@ -75,22 +75,60 @@ http_session.mount("https://", adapter)
 http_session.mount("http://", adapter)
 
 
-# --- Token Cache Helpers --- #
+# --- Persistent Token Cache (URL Sync + Local Disk Fallback) --- #
 def load_saved_tokens() -> dict:
+    tokens = {}
+    # 1. Primary: load from browser URL parameters (survives Render restarts)
+    if "tokens" in st.query_params:
+        try:
+            raw_param = st.query_params["tokens"]
+            decoded = base64.urlsafe_b64decode(raw_param.encode("utf-8")).decode("utf-8")
+            url_tokens = json.loads(decoded)
+            if isinstance(url_tokens, dict):
+                tokens.update(url_tokens)
+        except Exception:
+            pass
+
+    # 2. Secondary: load from local container cache if present
     if os.path.exists(TOKEN_STORE_FILE):
         try:
             with open(TOKEN_STORE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                disk_tokens = json.load(f)
+                if isinstance(disk_tokens, dict):
+                    for k, v in disk_tokens.items():
+                        if k not in tokens:
+                            tokens[k] = v
         except Exception:
-            return {}
-    return {}
+            pass
+
+    return tokens
 
 
 def save_token_to_disk(identifier: str, token: str):
     tokens = load_saved_tokens()
-    tokens[str(identifier).strip()] = token.strip()
-    with open(TOKEN_STORE_FILE, "w", encoding="utf-8") as f:
-        json.dump(tokens, f, indent=2)
+    clean_id = str(identifier).strip()
+    clean_tok = token.strip()
+
+    if clean_tok:
+        tokens[clean_id] = clean_tok
+    elif clean_id in tokens:
+        del tokens[clean_id]
+
+    # Save to disk
+    try:
+        with open(TOKEN_STORE_FILE, "w", encoding="utf-8") as f:
+            json.dump(tokens, f, indent=2)
+    except Exception:
+        pass
+
+    # Sync directly to browser URL query params
+    try:
+        encoded_tokens = base64.urlsafe_b64encode(
+            json.dumps(tokens, separators=(",", ":")).encode("utf-8")
+        ).decode("utf-8")
+        st.query_params["tokens"] = encoded_tokens
+    except Exception:
+        pass
 
 
 # --- Request Helpers --- #
@@ -248,19 +286,6 @@ def fetch_project_listing_filtered(filters: dict):
 def fetch_all_project_subdetails(project_id: str, promoter_id: str):
     lookup_payload = {"projectId": str(project_id), "promoterId": str(promoter_id)}
 
-    fin_endpoints = [
-        "pms/api/project/ProjectBooking/financialDetails",
-        "pms/api/project/ProjectOverview/financialDetails",
-        "pms/api/project/ProjectBooking/projectFinancial",
-        "pms/api/project/ProjectOverview/getFinancialDetails",
-    ]
-    fin_res = {}
-    for ep in fin_endpoints:
-        res = post_pms_api(ep, lookup_payload)
-        if isinstance(res, dict) and res.get("result"):
-            fin_res = res
-            break
-
     return {
         "projectDetails": post_pms_api("pms/api/project/ProjectOverview/projectDetails", lookup_payload),
         "facilityDetails": post_pms_api("pms/api/project/ProjectOverview/facilityDetails", lookup_payload),
@@ -270,7 +295,6 @@ def fetch_all_project_subdetails(project_id: str, promoter_id: str):
         "bankDetails": post_pms_api("pms/api/project/ProjectOverview/getBankAccountDetails", lookup_payload),
         "projectDocuments": post_pms_api("pms/api/project/ProjectBooking/projectDocument", lookup_payload),
         "professionalDetails": post_pms_api("pms/api/project/ProjectBooking/professinalDetails", lookup_payload),
-        "financialDetails": fin_res,
         "plottedUnitsData": post_pms_api("pms/api/project/ProjectPreviewDetails/getPlottedUnitsData", lookup_payload),
         "plottedBookingDetails": post_pms_api("pms/api/project/ProjectPreviewDetails/getProjectPlottedBookingDetails", lookup_payload),
         "parkingDetails": post_pms_api("pms/api/project/ProjectPreviewDetails/getParkingDetails", lookup_payload),
@@ -348,17 +372,14 @@ def extract_overview_documents(prj_data: dict, p_info: dict):
         if cert_id:
             add_item("Registration Certificate", cert_id, "Project Details")
 
-        if prj_data.get("estimateCopyDocId"):
-            add_item("Project Cost Estimate Copy", prj_data["estimateCopyDocId"], "Project Details")
-        if prj_data.get("approvedPlanDocId") or prj_data.get("approvalLetterDocId"):
-            add_item("Approved Layout Plan", prj_data.get("approvedPlanDocId") or prj_data.get("approvalLetterDocId"), "Planning Approval")
-        if prj_data.get("commencementCertDocId"):
-            add_item("Commencement Certificate", prj_data["commencementCertDocId"], "Planning Approval")
-
-        if prj_data.get("electricityDocId"):
-            add_item("Electricity Supply NOC", prj_data["electricityDocId"], "Utility NOCs")
-        if prj_data.get("waterDocId"):
-            add_item("Water Supply NOC", prj_data["waterDocId"], "Utility NOCs")
+        if prj_data.get("buildingPlanId"):
+            add_item("Approved Building Plan", prj_data["buildingPlanId"], "Layout Plans")
+        if prj_data.get("sitePlanId"):
+            add_item("Approved Site Plan", prj_data["sitePlanId"], "Layout Plans")
+        if prj_data.get("buildingDrawPlanId"):
+            add_item("Building Drawing Plan", prj_data["buildingDrawPlanId"], "Layout Plans")
+        if prj_data.get("nakhshaLocationId"):
+            add_item("Nakhsha / Location Map", prj_data["nakhshaLocationId"], "Layout Plans")
 
     return docs
 
@@ -384,11 +405,18 @@ def extract_all_documents(p_info: dict, sub_data: dict):
     land_details = sub_data.get("landDetails", {}).get("result", [])
     doc_res = sub_data.get("projectDocuments", {})
     prom_details = sub_data.get("promoterDetails", {}).get("result", {})
+    fac_list = sub_data.get("facilityDetails", {}).get("result", [])
 
-    # Overview / Master Documents
+    # Overview / Master Documents & Blueprints
     overview_docs = extract_overview_documents(prj_details, p_info)
     for ov_doc in overview_docs:
         add_doc(ov_doc["Document Name"], ov_doc["Identifier"], ov_doc["Source"])
+
+    # Facility Documents (Electricity NOC, Water Supply NOC, etc.)
+    if isinstance(fac_list, list):
+        for fac in fac_list:
+            if fac.get("documentId") and fac["documentId"] != 0:
+                add_doc(f"{fac.get('facilityName', 'Facility')} Document", fac["documentId"], "Facilities")
 
     # ProjectBooking Documents
     pdocs = extract_project_booking_documents(doc_res)
@@ -409,6 +437,11 @@ def extract_all_documents(p_info: dict, sub_data: dict):
         if plot.get("shareAllocId") and plot.get("shareAllocId") != 0:
             add_doc(f"Share Allocation - Plot {plot_no}", plot["shareAllocId"], f"Plot {plot_no}")
 
+        # Land Owner Share Documents
+        for o in plot.get("owners", []):
+            if o.get("fileId") and o["fileId"] != 0:
+                add_doc(f"Owner Share Document - {o.get('name', 'Owner')}", o["fileId"], f"Plot {plot_no}")
+
     # Promoter Files
     if isinstance(prom_details, dict):
         if prom_details.get("registrationCertId"):
@@ -418,25 +451,19 @@ def extract_all_documents(p_info: dict, sub_data: dict):
         if prom_details.get("panCopyId"):
             add_doc("Promoter PAN Copy", prom_details["panCopyId"], "Promoter Details")
 
-    # Bank Statements
-    bank_data = sub_data.get("bankDetails", {}).get("result", {})
-    if isinstance(bank_data, list) and len(bank_data) > 0:
-        bank_data = bank_data[0]
-    if isinstance(bank_data, dict):
-        if bank_data.get("bankStatementDocId"):
-            add_doc("Bank Statement", bank_data["bankStatementDocId"], "Bank Details")
-        if bank_data.get("passbookDocId"):
-            add_doc("Bank Passbook Copy", bank_data["passbookDocId"], "Bank Details")
+    # Bank Account & Financial Estimate Documents
+    bank_resp = sub_data.get("bankDetails", {})
+    if isinstance(bank_resp, dict):
+        b_res = bank_resp.get("result", {})
+        if isinstance(b_res, dict):
+            if b_res.get("reraCancellChequeId"):
+                add_doc("Bank Account Cheque / Passbook", b_res["reraCancellChequeId"], "Bank Account Details")
+            if b_res.get("bankStatementDocId"):
+                add_doc("Bank Statement", b_res["bankStatementDocId"], "Bank Account Details")
 
-    # Financial Estimates
-    fin_data = sub_data.get("financialDetails", {}).get("result", {})
-    if isinstance(fin_data, list) and len(fin_data) > 0:
-        fin_data = fin_data[0]
-    if isinstance(fin_data, dict):
-        if fin_data.get("estimateCopyDocId"):
-            add_doc("Project Estimate Copy", fin_data["estimateCopyDocId"], "Financial Details")
-        if fin_data.get("documentId"):
-            add_doc("Financial Estimate Document", fin_data["documentId"], "Financial Details")
+        f_query = bank_resp.get("fundSourceQuery", {})
+        if isinstance(f_query, dict) and f_query.get("estimationCopyId"):
+            add_doc("Project Estimate Copy", f_query["estimationCopyId"], "Financial Details")
 
     # Professional Certificates
     prof_data = sub_data.get("professionalDetails", {}).get("result", [])
@@ -557,7 +584,7 @@ def render_documents_manager(docs_list: list, unique_key_prefix: str):
                 label_visibility="collapsed",
             )
 
-            # Persist immediately to disk and memory on change
+            # Persist token to disk and browser query parameters immediately on edit
             if token_input.strip() and token_input.strip() != current_token:
                 clean_tok = token_input.strip()
                 save_token_to_disk(identifier, clean_tok)
@@ -1011,49 +1038,101 @@ else:
                     st.info("No Annual Audit Certificates (AAC) recorded.")
 
             with t_bank:
-                bank_info = sub_details.get("bankDetails", {}).get("result", {})
-                if bank_info:
-                    st.json(bank_info)
+                st.markdown("#### 🏦 Bank Account Details")
+                st.caption(f"RERA Designated Account details for **{p_name}**")
+
+                bank_info = sub_details.get("bankDetails", {})
+                b_res = bank_info.get("result", {}) if isinstance(bank_info, dict) else {}
+
+                if b_res and isinstance(b_res, dict):
+                    b_col1, b_col2 = st.columns(2)
+                    with b_col1:
+                        st.markdown(f"**A/C Holder Name:** {b_res.get('reraAccHolder', '--')}")
+                        st.markdown(f"**Bank Name:** {b_res.get('reraAccbank', '--')}")
+                        st.markdown(f"**Branch Name:** {b_res.get('reraAccbranch', '--')}")
+                    with b_col2:
+                        st.markdown(f"**A/C Number:** `{b_res.get('reraAccNo', '--')}`")
+                        st.markdown(f"**IFSC Code:** `{b_res.get('reraAccIFSc', '--')}`")
+                        st.markdown(f"**Branch Mobile:** {b_res.get('reraBranchMobile', '--')}")
+
+                    cheque_id = b_res.get("reraCancellChequeId")
+                    if cheque_id:
+                        st.markdown("##### 📄 Cancelled Cheque / Passbook Attachment")
+                        saved_tokens = load_saved_tokens()
+                        render_documents_manager([{
+                            "Document Name": "Bank Cancelled Cheque / Passbook",
+                            "Identifier": str(cheque_id),
+                            "Source": "Bank Account Details",
+                            "Token": saved_tokens.get(str(cheque_id), "")
+                        }], unique_key_prefix=f"bank_{p_id}")
                 else:
                     st.info("No bank account details reported.")
 
             with t_fin:
-                fin_data = sub_details.get("financialDetails", {})
-                fin_res = fin_data.get("result", {}) if isinstance(fin_data, dict) else {}
-                if isinstance(fin_res, list) and len(fin_res) > 0:
-                    fin_res = fin_res[0]
+                st.markdown("#### 💰 Financial Details (in Lakhs)")
+                st.caption(f"Estimated costs and fund mobilization breakdown from `fundSourceQuery` for **{p_name}**")
 
-                prj_data = sub_details.get("projectDetails", {}).get("result", {})
-                if not fin_res and isinstance(prj_data, dict):
-                    est_cost = prj_data.get("estProjectCost") or prj_data.get("estimatedProjectCost") or prj_data.get("projectCost")
-                    if est_cost:
-                        fin_res = {
-                            "Estimated Project Cost (in Lakhs)": est_cost,
-                            "Fund to be invested by promoter from own source": prj_data.get("ownFund") or prj_data.get("promoterFund") or "0.00",
-                            "Funds to be mobilized from allottees": prj_data.get("allotteeFund") or prj_data.get("fundFromAllottees") or "0.00",
-                            "Funds to be mobilized through Bank finance": prj_data.get("bankFinance") or prj_data.get("bankLoan") or "0.00",
-                            "Funds to be mobilized through Investor": prj_data.get("investorFund") or "0.00",
-                        }
+                bank_resp = sub_details.get("bankDetails", {})
+                fund_data = bank_resp.get("fundSourceQuery", {}) if isinstance(bank_resp, dict) else {}
 
-                if fin_res and isinstance(fin_res, dict):
-                    cf1, cf2, cf3 = st.columns(3)
-                    cost_val = fin_res.get("Estimated Project Cost (in Lakhs)") or fin_res.get("estProjectCost") or fin_res.get("estimatedProjectCost") or "--"
-                    own_val = fin_res.get("Fund to be invested by promoter from own source") or fin_res.get("ownFund") or "--"
-                    allot_val = fin_res.get("Funds to be mobilized from allottees") or fin_res.get("allotteeFund") or "--"
+                if fund_data and isinstance(fund_data, dict):
+                    est_cost = fund_data.get("estematedCost", "0.00")
+                    promoter_fund = fund_data.get("promoterInvestment", "0.00")
+                    allottee_fund = fund_data.get("allotteeInvestment", "0.00")
+                    bank_fund = fund_data.get("fromBank", "0.00")
+                    investor_fund = fund_data.get("fromInvestors", "0.00")
+                    est_doc_id = fund_data.get("estimationCopyId")
 
-                    with cf1:
-                        st.metric("Total Project Cost", f"₹ {cost_val} Lakhs")
-                    with cf2:
-                        st.metric("Promoter Own Funds", f"₹ {own_val} Lakhs")
-                    with cf3:
-                        st.metric("From Allottees", f"₹ {allot_val} Lakhs")
+                    # Highlight Metrics
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        st.metric("Estimated Project Cost", f"₹ {est_cost} Lakhs")
+                    with c2:
+                        st.metric("Promoter Own Funds", f"₹ {promoter_fund} Lakhs")
+                    with c3:
+                        st.metric("From Allottees", f"₹ {allottee_fund} Lakhs")
 
-                    st.divider()
-                    st.json(fin_res)
+                    st.markdown("---")
+
+                    # Structured Table
+                    fin_df = pd.DataFrame([
+                        {"Financial Component": "Estimated Project Cost", "Amount (₹ in Lakhs)": est_cost},
+                        {"Financial Component": "Fund to be invested by promoter from own source", "Amount (₹ in Lakhs)": promoter_fund},
+                        {"Financial Component": "Funds to be mobilized from allottees", "Amount (₹ in Lakhs)": allottee_fund},
+                        {"Financial Component": "Funds to be mobilized through Bank finance", "Amount (₹ in Lakhs)": bank_fund},
+                        {"Financial Component": "Funds to be mobilized through Investor", "Amount (₹ in Lakhs)": investor_fund},
+                    ])
+                    st.dataframe(fin_df, use_container_width=True, hide_index=True)
+
+                    # Estimate Copy Document Token Manager
+                    if est_doc_id:
+                        st.markdown("##### 📄 Estimate Copy Attachment")
+                        saved_tokens = load_saved_tokens()
+                        render_documents_manager([{
+                            "Document Name": "Project Estimate Copy",
+                            "Identifier": str(est_doc_id),
+                            "Source": "Financial Details",
+                            "Token": saved_tokens.get(str(est_doc_id), "")
+                        }], unique_key_prefix=f"fin_{p_id}")
                 else:
-                    st.info("No financial records reported.")
+                    st.info("No financial records reported for this project.")
 
             with t_land:
-                st.dataframe(pd.DataFrame(sub_details.get("landDetails", {}).get("result", [])), use_container_width=True)
+                st.markdown("#### 🏞️ Land Details of the Project")
+                st.caption(f"Plot khata, mouza, area, encumbrance, and title flow details for **{p_name}**")
+
+                land_items = sub_details.get("landDetails", {}).get("result", [])
+                if isinstance(land_items, list) and len(land_items) > 0:
+                    st.dataframe(pd.DataFrame(land_items), use_container_width=True)
+                else:
+                    st.info("No land details reported.")
+
             with t_fac:
-                st.json(sub_details.get("facilityDetails", {}).get("result", []))
+                st.markdown("#### 🏊 Facilities of the Project")
+                st.caption(f"Internal/external roads, utility NOCs, boundary walls, and development for **{p_name}**")
+
+                fac_items = sub_details.get("facilityDetails", {}).get("result", [])
+                if isinstance(fac_items, list) and len(fac_items) > 0:
+                    st.dataframe(pd.DataFrame(fac_items), use_container_width=True)
+                else:
+                    st.info("No facility details reported.")
