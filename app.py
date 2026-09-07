@@ -1,3 +1,6 @@
+import base64
+import hashlib
+import hmac
 import io
 import json
 import os
@@ -5,6 +8,8 @@ import re
 import zipfile
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 import streamlit as st
 
 st.set_page_config(
@@ -19,7 +24,10 @@ try:
 except ImportError:
     pass
 
-MY_API_URL = os.getenv("MY_API_URL", "http://localhost:8000/api/v1").rstrip("/")
+# Read configuration solely from environment
+API_HASHING_KEY = os.getenv("API_HASHING_KEY")
+BASE_URL = os.getenv("BASE_URL", "https://reraapps.odisha.gov.in").rstrip("/")
+ODISHA_STATE_ID = int(os.getenv("ODISHA_STATE_ID", 21))
 TOKEN_STORE_FILE = os.getenv("TOKEN_STORE_FILE", "tokens_cache.json")
 UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").rstrip("/")
 UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
@@ -57,8 +65,109 @@ STATIC_DISTRICTS = [
     {"id": 379, "name": "Sundargarh"},
 ]
 
+# --- Internal Gateway Service (Conceals Signatures & Portals) --- #
+class InternalGateway:
+    def __init__(self):
+        self.session = requests.Session()
+        retries = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            raise_on_status=False,
+        )
+        self.session.mount("https://", HTTPAdapter(max_retries=retries))
+        self.session.mount("http://", HTTPAdapter(max_retries=retries))
 
-# --- Persistent Token Cache --- #
+    def _sign_payload(self, data) -> dict:
+        if not API_HASHING_KEY:
+            return {}
+        json_str = json.dumps(data, separators=(",", ":")) if isinstance(data, (dict, list)) else str(data)
+        encoded = base64.b64encode(json_str.encode("utf-8")).decode("utf-8")
+        token = hmac.new(
+            API_HASHING_KEY.encode("utf-8"),
+            encoded.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        return {"REQUEST_DATA": encoded, "REQUEST_TOKEN": token}
+
+    def _decode_response(self, res_json: dict):
+        if isinstance(res_json, dict) and "RESPONSE_DATA" in res_json:
+            decoded_raw = base64.b64decode(res_json["RESPONSE_DATA"]).decode("utf-8")
+            try:
+                return json.loads(decoded_raw)
+            except Exception:
+                return decoded_raw
+        return res_json
+
+    def _get_headers(self) -> dict:
+        auth_meta = self._sign_payload({"USER_AUTHKEY": "", "USER_ID": "", "USER_TYPE": "2"})
+        return {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+            "Origin": "https://rera.odisha.gov.in",
+            "Referer": "https://rera.odisha.gov.in/",
+            "Authorization": json.dumps(auth_meta, separators=(",", ":")),
+        }
+
+    def post(self, endpoint: str, data):
+        url = f"{BASE_URL}/{endpoint.lstrip('/')}"
+        try:
+            res = self.session.post(
+                url,
+                headers=self._get_headers(),
+                json=self._sign_payload(data),
+                timeout=30,
+            )
+            if res.status_code == 200:
+                return self._decode_response(res.json())
+        except Exception:
+            pass
+        return {}
+
+    def fetch_pdf(self, file_id: str | int, token: str):
+        clean_id = str(file_id).strip()
+        clean_tok = token.strip()
+        if not clean_id.isdigit() or not clean_tok:
+            return None
+
+        decrypt_url = f"{BASE_URL}/dms/fileDecryptHandlerForPdfPublic"
+        dms_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Origin": BASE_URL,
+            "Referer": f"{BASE_URL}/dms/public/library/pdfjsnewds/web/viewer.html?fileId={clean_id}&text={clean_tok}",
+            "Authorization": f"bearer {clean_tok}",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        try:
+            res = self.session.post(
+                decrypt_url,
+                headers=dms_headers,
+                data={"fileId": clean_id, "token": clean_tok},
+                timeout=25,
+            )
+            if res.status_code == 200:
+                dec_data = self._decode_response(res.json())
+                pdf_path = (
+                    dec_data.get("result", {}).get("filePath")
+                    if isinstance(dec_data.get("result"), dict)
+                    else dec_data.get("result") or dec_data.get("filePath")
+                )
+                if pdf_path and isinstance(pdf_path, str):
+                    pdf_url = pdf_path if pdf_path.startswith("http") else f"{BASE_URL}/{pdf_path.lstrip('/')}"
+                    pdf_res = self.session.get(pdf_url, headers=dms_headers, timeout=30)
+                    if pdf_res.status_code == 200 and pdf_res.content.startswith(b"%PDF"):
+                        return pdf_res.content
+        except Exception:
+            pass
+        return None
+
+gateway = InternalGateway()
+
+
+# --- Persistent Token Cache (Cloud Redis + Local Fallback) --- #
 def load_saved_tokens() -> dict:
     if UPSTASH_URL and UPSTASH_TOKEN:
         try:
@@ -120,95 +229,72 @@ def save_token_to_disk(identifier: str, token: str):
             pass
 
 
-# --- API Client Helpers --- #
+# --- Clean Business Logic Endpoints (Internal Router) --- #
 @st.cache_data(show_spinner=False, ttl=3600)
-def fetch_districts():
-    try:
-        res = requests.get(f"{MY_API_URL}/demography/districts", timeout=10)
-        if res.status_code == 200:
-            data = res.json()
-            if isinstance(data, list) and data:
-                return data
-            if isinstance(data, dict) and data.get("result"):
-                return data["result"]
-    except Exception:
-        pass
+def api_get_districts():
+    res = gateway.post("pms/api/master/Demography/getDistrict", ODISHA_STATE_ID)
+    if isinstance(res, list) and len(res) > 0:
+        return res
+    if isinstance(res, dict) and res.get("result"):
+        return res["result"]
     return STATIC_DISTRICTS
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def fetch_tahasils(district_id: int):
+def api_get_tahasils(district_id: int):
     if not district_id:
         return []
-    try:
-        res = requests.get(f"{MY_API_URL}/demography/tahasils/{district_id}", timeout=10)
-        if res.status_code == 200:
-            data = res.json()
-            if isinstance(data, list):
-                return data
-            if isinstance(data, dict) and "result" in data:
-                return data["result"]
-    except Exception:
-        pass
+    res = gateway.post("pms/api/master/Demography/getTahasil", int(district_id))
+    if isinstance(res, list):
+        return res
+    if isinstance(res, dict) and "result" in res:
+        return res["result"]
     return []
 
 
-def fetch_pdf_bytes_from_gateway(file_id: str | int, token: str):
-    if not file_id or not token:
-        return None
-    try:
-        res = requests.get(
-            f"{MY_API_URL}/documents/{file_id}/download",
-            params={"token": token.strip()},
-            timeout=25,
-        )
-        if res.status_code == 200:
-            return res.content
-    except Exception:
-        pass
-    return None
+def api_search_projects(filters: dict):
+    payload = {
+        "searchTerm": filters.get("search_term", "").strip(),
+        "district": filters.get("district", 0),
+        "tahasil": filters.get("tahasil", 0),
+        "strtYear": filters.get("start_year", 0),
+        "endYear": filters.get("possession_year", 0),
+        "carpetArea": filters.get("carpet_area", ""),
+        "propertyType": filters.get("property_types", []),
+        "projectStatus": filters.get("project_statuses", []),
+        "latitude": "",
+        "longitude": "",
+        "radius": "",
+        "approvedStatus": False,
+        "revokedStatus": False,
+        "page": filters.get("page", 1),
+        "pageSize": filters.get("page_size", 10),
+        "sortOrder": "asc",
+    }
+    return gateway.post("pms/api/master/Projects/projectListing", payload)
 
 
-def fetch_project_listing_filtered(filters: dict):
-    try:
-        res = requests.post(f"{MY_API_URL}/projects/search", json=filters, timeout=30)
-        if res.status_code == 200:
-            return res.json()
-    except Exception:
-        pass
-    return {}
-
-
-def fetch_all_project_subdetails(project_id: str, promoter_id: str):
-    params = {"promoter_id": promoter_id}
-    endpoints = {
-        "projectDetails": f"projects/{project_id}/details",
-        "facilityDetails": f"projects/{project_id}/facilities",
-        "landDetails": f"projects/{project_id}/land",
-        "promoterDetails": f"projects/{project_id}/promoter",
-        "boardMembers": f"projects/{project_id}/board-members",
-        "bankDetails": f"projects/{project_id}/bank-and-financials",
-        "projectDocuments": f"projects/{project_id}/documents",
-        "professionalDetails": f"projects/{project_id}/professionals",
-        "plottedUnitsData": f"projects/{project_id}/plotted-units",
-        "plottedBookingDetails": f"projects/{project_id}/bookings",
-        "parkingDetails": f"projects/{project_id}/parking",
-        "projectMilestone": f"projects/{project_id}/milestones",
-        "qprList": f"projects/{project_id}/qpr",
-        "aacList": f"projects/{project_id}/aac",
+def api_get_all_subdetails(project_id: str, promoter_id: str):
+    p_body = {"projectId": str(project_id), "promoterId": str(promoter_id)}
+    return {
+        "projectDetails": gateway.post("pms/api/project/ProjectOverview/projectDetails", p_body),
+        "facilityDetails": gateway.post("pms/api/project/ProjectOverview/facilityDetails", p_body),
+        "landDetails": gateway.post("pms/api/project/ProjectOverview/landDetails", p_body),
+        "promoterDetails": gateway.post("pms/api/project/ProjectOverview/promoterDetails", p_body),
+        "boardMembers": gateway.post("pms/api/project/ProjectOverview/getBoardMemberDetails", p_body),
+        "bankDetails": gateway.post("pms/api/project/ProjectOverview/getBankAccountDetails", p_body),
+        "projectDocuments": gateway.post("pms/api/project/ProjectBooking/projectDocument", p_body),
+        "professionalDetails": gateway.post("pms/api/project/ProjectBooking/professinalDetails", p_body),
+        "plottedUnitsData": gateway.post("pms/api/project/ProjectPreviewDetails/getPlottedUnitsData", p_body),
+        "plottedBookingDetails": gateway.post("pms/api/project/ProjectPreviewDetails/getProjectPlottedBookingDetails", p_body),
+        "parkingDetails": gateway.post("pms/api/project/ProjectPreviewDetails/getParkingDetails", p_body),
+        "projectMilestone": gateway.post("pms/api/project/projectMilestoneCitizen/projectMilestoneCitizenView", p_body),
+        "qprList": gateway.post("pms/api/qpr/QprList/getQPRPromoterList", p_body),
+        "aacList": gateway.post("pms/api/qpr/Aacannualreport/getAACList", p_body),
     }
 
-    results = {}
-    for key, path in endpoints.items():
-        try:
-            r = requests.get(f"{MY_API_URL}/{path}", params=params, timeout=20)
-            results[key] = r.json() if r.status_code == 200 else {}
-        except Exception:
-            results[key] = {}
-    return results
 
-
-# --- Document Parsing & Packaging --- #
+# --- Document Processing & Builders --- #
 def extract_project_booking_documents(doc_res: dict):
     docs = []
     seen = set()
@@ -375,7 +461,7 @@ def build_project_zip(docs_list: list):
         for doc in docs_list:
             token = doc.get("Token", "")
             if token:
-                pdf_bytes = fetch_pdf_bytes_from_gateway(doc["Identifier"], token)
+                pdf_bytes = gateway.fetch_pdf(doc["Identifier"], token)
                 if pdf_bytes:
                     clean_name = f"{re.sub(r'[^a-zA-Z0-9_-]', '_', doc['Document Name'])}.pdf"
                     zip_file.writestr(clean_name, pdf_bytes)
@@ -441,7 +527,7 @@ def render_documents_manager(docs_list: list, unique_key_prefix: str):
 
         with col_dl:
             if current_token:
-                pdf_data = fetch_pdf_bytes_from_gateway(identifier, current_token)
+                pdf_data = gateway.fetch_pdf(identifier, current_token)
                 if pdf_data:
                     clean_filename = f"{re.sub(r'[^a-zA-Z0-9_-]', '_', doc_name)}.pdf"
                     st.download_button(
@@ -478,13 +564,13 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("##### 📍 Demography")
 
-    districts = fetch_districts()
+    districts = api_get_districts()
     dist_map = {0: "Select District"}
     for d in districts:
         dist_map[d.get("id")] = d.get("name")
 
     selected_district_id = st.selectbox("District", options=list(dist_map.keys()), format_func=lambda x: dist_map[x], key="f_district")
-    tahasils = fetch_tahasils(selected_district_id) if selected_district_id else []
+    tahasils = api_get_tahasils(selected_district_id) if selected_district_id else []
     tahasil_map = {0: "Tahasil"}
     for t in tahasils:
         tahasil_map[t.get("id")] = t.get("name")
@@ -547,8 +633,8 @@ filter_payload = {
     "page_size": page_size,
 }
 
-with st.spinner("Fetching matching records from gateway..."):
-    listing_response = fetch_project_listing_filtered(filter_payload)
+with st.spinner("Fetching matching records..."):
+    listing_response = api_search_projects(filter_payload)
     projects_found = listing_response.get("result", [])
     total_found = listing_response.get("total", 0)
 
@@ -574,7 +660,7 @@ else:
             with c3:
                 st.markdown(f"**Units:** `{p.get('unit_count') or p.get('plot_unit_count') or '--'}`")
 
-            sub_details = fetch_all_project_subdetails(p_id, pr_id)
+            sub_details = api_get_all_subdetails(p_id, pr_id)
             docs_extracted = extract_all_documents(p, sub_details)
 
             t_docs, t_proj_docs, t_json, t_overview, t_prom, t_bm, t_prof, t_units, t_ms, t_qpr, t_aac, t_bank, t_fin, t_land, t_fac = st.tabs(
