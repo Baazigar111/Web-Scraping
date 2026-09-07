@@ -1055,6 +1055,5 @@ else:
 
             with t_land:
                 st.dataframe(pd.DataFrame(sub_details.get("landDetails", {}).get("result", [])), use_container_width=True)
-
             with t_fac:
                 st.json(sub_details.get("facilityDetails", {}).get("result", []))
