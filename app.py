@@ -24,7 +24,6 @@ try:
 except ImportError:
     pass
 
-# Read configuration solely from environment
 API_HASHING_KEY = os.getenv("API_HASHING_KEY")
 BASE_URL = os.getenv("BASE_URL", "https://reraapps.odisha.gov.in").rstrip("/")
 ODISHA_STATE_ID = int(os.getenv("ODISHA_STATE_ID", 21))
@@ -294,6 +293,41 @@ def api_get_all_subdetails(project_id: str, promoter_id: str):
     }
 
 
+# --- Safe Table / JSON Rendering Helper --- #
+def render_safe_table_or_json(raw_data, empty_msg="No records found."):
+    if not raw_data:
+        st.info(empty_msg)
+        return
+
+    if isinstance(raw_data, list):
+        if len(raw_data) == 0:
+            st.info(empty_msg)
+            return
+        try:
+            st.dataframe(pd.DataFrame(raw_data), use_container_width=True)
+            return
+        except Exception:
+            st.json(raw_data)
+            return
+
+    if isinstance(raw_data, dict):
+        for key in ["result", "data", "unitList", "projectUnitList", "parkingList"]:
+            sub_val = raw_data.get(key)
+            if isinstance(sub_val, list):
+                if len(sub_val) == 0:
+                    st.info(empty_msg)
+                    return
+                try:
+                    st.dataframe(pd.DataFrame(sub_val), use_container_width=True)
+                    return
+                except Exception:
+                    pass
+        st.json(raw_data)
+        return
+
+    st.info(empty_msg)
+
+
 # --- Document Processing & Builders --- #
 def extract_project_booking_documents(doc_res: dict):
     docs = []
@@ -395,20 +429,21 @@ def extract_all_documents(p_info: dict, sub_data: dict):
     for pd_item in extract_project_booking_documents(doc_res):
         add_doc(pd_item["Document Name"], pd_item["Identifier"], pd_item["Source"])
 
-    for idx, plot in enumerate(land_details):
-        p_no = plot.get("plotNo", f"Plot #{idx+1}")
-        for k, label in [
-            ("plotEcId", "Encumbrance Certificate"),
-            ("plotRorId", "Record of Rights (ROR)"),
-            ("saleDeedId", "Sale Deed"),
-            ("poaId", "Power of Attorney (POA)"),
-            ("shareAllocId", "Share Allocation"),
-        ]:
-            if plot.get(k) and plot[k] != 0:
-                add_doc(f"{label} - Plot {p_no}", plot[k], f"Plot {p_no}")
-        for o in plot.get("owners", []):
-            if o.get("fileId") and o["fileId"] != 0:
-                add_doc(f"Owner Share Document - {o.get('name', 'Owner')}", o["fileId"], f"Plot {p_no}")
+    if isinstance(land_details, list):
+        for idx, plot in enumerate(land_details):
+            p_no = plot.get("plotNo", f"Plot #{idx+1}")
+            for k, label in [
+                ("plotEcId", "Encumbrance Certificate"),
+                ("plotRorId", "Record of Rights (ROR)"),
+                ("saleDeedId", "Sale Deed"),
+                ("poaId", "Power of Attorney (POA)"),
+                ("shareAllocId", "Share Allocation"),
+            ]:
+                if plot.get(k) and plot[k] != 0:
+                    add_doc(f"{label} - Plot {p_no}", plot[k], f"Plot {p_no}")
+            for o in plot.get("owners", []):
+                if o.get("fileId") and o["fileId"] != 0:
+                    add_doc(f"Owner Share Document - {o.get('name', 'Owner')}", o["fileId"], f"Plot {p_no}")
 
     if isinstance(prom_details, dict):
         for k, label in [
@@ -717,27 +752,28 @@ else:
 
             with t_bm:
                 bm = sub_details.get("boardMembers", {}).get("result", [])
-                st.dataframe(pd.DataFrame(bm), use_container_width=True) if bm else st.info("No board members registered.")
+                render_safe_table_or_json(bm, "No board members registered.")
 
             with t_prof:
                 profs = sub_details.get("professionalDetails", {}).get("result", [])
-                st.dataframe(pd.DataFrame(profs), use_container_width=True) if profs else st.info("No professionals registered.")
+                render_safe_table_or_json(profs, "No professionals registered.")
 
             with t_units:
-                units = sub_details.get("plottedUnitsData", {}).get("result", [])
-                st.dataframe(pd.DataFrame(units), use_container_width=True) if units else st.info("No units inventory reported.")
+                raw_units = sub_details.get("plottedUnitsData", {})
+                units = raw_units.get("result", raw_units) if isinstance(raw_units, dict) else raw_units
+                render_safe_table_or_json(units, "No units inventory reported.")
 
             with t_ms:
                 ms = sub_details.get("projectMilestone", {}).get("result", [])
-                st.dataframe(pd.DataFrame(ms), use_container_width=True) if ms else st.info("No milestones reported.")
+                render_safe_table_or_json(ms, "No milestones reported.")
 
             with t_qpr:
                 qpr = sub_details.get("qprList", {}).get("result", [])
-                st.dataframe(pd.DataFrame(qpr), use_container_width=True) if qpr else st.info("No QPR reports available.")
+                render_safe_table_or_json(qpr, "No QPR reports available.")
 
             with t_aac:
                 aac = sub_details.get("aacList", {}).get("result", [])
-                st.dataframe(pd.DataFrame(aac), use_container_width=True) if aac else st.info("No AAC audits available.")
+                render_safe_table_or_json(aac, "No AAC audits available.")
 
             with t_bank:
                 b_res = sub_details.get("bankDetails", {}).get("result", {})
@@ -775,8 +811,8 @@ else:
 
             with t_land:
                 land = sub_details.get("landDetails", {}).get("result", [])
-                st.dataframe(pd.DataFrame(land), use_container_width=True) if land else st.info("No land records available.")
+                render_safe_table_or_json(land, "No land records available.")
 
             with t_fac:
                 fac = sub_details.get("facilityDetails", {}).get("result", [])
-                st.dataframe(pd.DataFrame(fac), use_container_width=True) if fac else st.info("No facility records available.")
+                render_safe_table_or_json(fac, "No facility records available.")
