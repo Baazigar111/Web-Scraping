@@ -169,8 +169,7 @@ def fetch_tahasils(district_id: int):
     return []
 
 
-# --- PDF Downloader & Decryptor --- #
-@st.cache_data(show_spinner=False)
+# --- PDF Downloader & Decryptor (Uncached to ensure instant token updates) --- #
 def fetch_pdf_bytes(file_id_or_name: str | int, token_override: str = ""):
     if not file_id_or_name:
         return None
@@ -386,7 +385,7 @@ def extract_all_documents(p_info: dict, sub_data: dict):
     doc_res = sub_data.get("projectDocuments", {})
     prom_details = sub_data.get("promoterDetails", {}).get("result", {})
 
-    # Registration Certificate & Project Details Docs
+    # Overview / Master Documents
     overview_docs = extract_overview_documents(prj_details, p_info)
     for ov_doc in overview_docs:
         add_doc(ov_doc["Document Name"], ov_doc["Identifier"], ov_doc["Source"])
@@ -396,7 +395,7 @@ def extract_all_documents(p_info: dict, sub_data: dict):
     for pd_item in pdocs:
         add_doc(pd_item["Document Name"], pd_item["Identifier"], pd_item["Source"])
 
-    # Land Plot Documents
+    # Land Documents
     for idx, plot in enumerate(land_details):
         plot_no = plot.get("plotNo", f"Plot #{idx+1}")
         if plot.get("plotEcId") and plot.get("plotEcId") != 0:
@@ -410,7 +409,7 @@ def extract_all_documents(p_info: dict, sub_data: dict):
         if plot.get("shareAllocId") and plot.get("shareAllocId") != 0:
             add_doc(f"Share Allocation - Plot {plot_no}", plot["shareAllocId"], f"Plot {plot_no}")
 
-    # Promoter Registration & Identity Files
+    # Promoter Files
     if isinstance(prom_details, dict):
         if prom_details.get("registrationCertId"):
             add_doc("Promoter Registration Certificate", prom_details["registrationCertId"], "Promoter Details")
@@ -419,7 +418,7 @@ def extract_all_documents(p_info: dict, sub_data: dict):
         if prom_details.get("panCopyId"):
             add_doc("Promoter PAN Copy", prom_details["panCopyId"], "Promoter Details")
 
-    # Bank Statements & Passbooks
+    # Bank Statements
     bank_data = sub_data.get("bankDetails", {}).get("result", {})
     if isinstance(bank_data, list) and len(bank_data) > 0:
         bank_data = bank_data[0]
@@ -429,7 +428,7 @@ def extract_all_documents(p_info: dict, sub_data: dict):
         if bank_data.get("passbookDocId"):
             add_doc("Bank Passbook Copy", bank_data["passbookDocId"], "Bank Details")
 
-    # Financial Estimates & Docs
+    # Financial Estimates
     fin_data = sub_data.get("financialDetails", {}).get("result", {})
     if isinstance(fin_data, list) and len(fin_data) > 0:
         fin_data = fin_data[0]
@@ -505,22 +504,34 @@ def render_documents_manager(docs_list: list, unique_key_prefix: str):
         return
 
     saved_tokens = load_saved_tokens()
+
+    # Pre-sync document tokens with cache and session state
+    for doc in docs_list:
+        ident = str(doc["Identifier"]).strip()
+        state_key = f"tok_{unique_key_prefix}_{ident}"
+        cached_tok = saved_tokens.get(ident, "")
+        if state_key in st.session_state and st.session_state[state_key].strip():
+            doc["Token"] = st.session_state[state_key].strip()
+        elif cached_tok:
+            doc["Token"] = cached_tok
+
     ready_count = sum(1 for d in docs_list if d.get("Token", "").strip())
 
     col_h1, col_h2 = st.columns([3, 1])
     with col_h1:
         st.markdown(f"**Total Documents:** {len(docs_list)} | **Tokens Active:** {ready_count}/{len(docs_list)}")
     with col_h2:
-        zip_bytes, count = build_project_zip(docs_list)
-        if count > 0:
-            st.download_button(
-                label=f"📦 Download Unlocked ({count}) as ZIP",
-                data=zip_bytes,
-                file_name=f"Project_{unique_key_prefix}_Documents.zip",
-                mime="application/zip",
-                key=f"{unique_key_prefix}_bulk_zip",
-                type="primary",
-            )
+        if ready_count > 0:
+            zip_bytes, count = build_project_zip(docs_list)
+            if count > 0:
+                st.download_button(
+                    label=f"📦 Download Unlocked ({count}) as ZIP",
+                    data=zip_bytes,
+                    file_name=f"Project_{unique_key_prefix}_Documents.zip",
+                    mime="application/zip",
+                    key=f"{unique_key_prefix}_bulk_zip",
+                    type="primary",
+                )
 
     st.markdown("---")
 
@@ -528,7 +539,8 @@ def render_documents_manager(docs_list: list, unique_key_prefix: str):
         doc_name = doc["Document Name"]
         identifier = str(doc["Identifier"]).strip()
         source = doc["Source"]
-        persisted_token = saved_tokens.get(identifier, doc.get("Token", ""))
+        state_key = f"tok_{unique_key_prefix}_{identifier}"
+        current_token = doc.get("Token", "").strip()
 
         col_name, col_token, col_link, col_dl = st.columns([4, 3, 2, 2])
 
@@ -539,23 +551,26 @@ def render_documents_manager(docs_list: list, unique_key_prefix: str):
         with col_token:
             token_input = st.text_input(
                 label=f"Token for {identifier}",
-                value=persisted_token,
+                value=current_token,
                 placeholder="Paste token (&text=...)",
-                key=f"tok_{unique_key_prefix}_{identifier}_{idx}",
+                key=state_key,
                 label_visibility="collapsed",
             )
-            if token_input != persisted_token:
-                save_token_to_disk(identifier, token_input)
-                doc["Token"] = token_input.strip()
+
+            # Persist immediately to disk and memory on change
+            if token_input.strip() and token_input.strip() != current_token:
+                clean_tok = token_input.strip()
+                save_token_to_disk(identifier, clean_tok)
+                doc["Token"] = clean_tok
                 st.rerun()
 
         with col_link:
-            viewer_url = get_browser_viewer_url(identifier, token=persisted_token)
+            viewer_url = get_browser_viewer_url(identifier, token=current_token)
             st.markdown(f"[🔗 Open in Viewer]({viewer_url})")
 
         with col_dl:
-            if persisted_token:
-                pdf_data = fetch_pdf_bytes(identifier, token_override=persisted_token)
+            if current_token:
+                pdf_data = fetch_pdf_bytes(identifier, token_override=current_token)
                 if pdf_data:
                     clean_filename = f"{re.sub(r'[^a-zA-Z0-9_-]', '_', doc_name)}.pdf"
                     st.download_button(
@@ -566,9 +581,10 @@ def render_documents_manager(docs_list: list, unique_key_prefix: str):
                         key=f"dl_{unique_key_prefix}_{identifier}_{idx}",
                     )
                 else:
-                    st.error("Invalid token")
+                    st.warning("⚠️ Invalid token")
             else:
-                st.caption("🔒 Paste Token")
+                st.caption("🔒 Paste Token & Enter")
+
         st.divider()
 
 
