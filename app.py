@@ -11,12 +11,32 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 import streamlit as st
+import streamlit.components.v1 as components
 
 st.set_page_config(
     page_title="Odisha RERA Filter & Project Explorer",
     page_icon="🏢",
     layout="wide",
 )
+
+# Run the persistent localStorage hook right at startup to auto-restore tokens across browser sessions
+def sync_tokens_with_local_storage():
+    bridge_html = """
+    <script>
+    (function() {
+        const stored = localStorage.getItem('rera_doc_tokens');
+        const urlParams = new URLSearchParams(window.location.search);
+        
+        if (stored && !urlParams.has('tokens')) {
+            urlParams.set('tokens', stored);
+            window.location.search = urlParams.toString();
+        }
+    })();
+    </script>
+    """
+    components.html(bridge_html, height=0, width=0)
+
+sync_tokens_with_local_storage()
 
 try:
     from dotenv import load_dotenv
@@ -75,10 +95,10 @@ http_session.mount("https://", adapter)
 http_session.mount("http://", adapter)
 
 
-# --- Persistent Token Cache (URL Sync + Local Disk Fallback) --- #
+# --- Persistent Token Cache (localStorage + URL Sync + Local Disk Fallback) --- #
 def load_saved_tokens() -> dict:
     tokens = {}
-    # 1. Primary: load from browser URL parameters (survives Render restarts)
+    # 1. Load from browser URL parameters
     if "tokens" in st.query_params:
         try:
             raw_param = st.query_params["tokens"]
@@ -89,7 +109,7 @@ def load_saved_tokens() -> dict:
         except Exception:
             pass
 
-    # 2. Secondary: load from local container cache if present
+    # 2. Load from local container cache if present
     if os.path.exists(TOKEN_STORE_FILE):
         try:
             with open(TOKEN_STORE_FILE, "r", encoding="utf-8") as f:
@@ -121,7 +141,8 @@ def save_token_to_disk(identifier: str, token: str):
     except Exception:
         pass
 
-    # Sync directly to browser URL query params
+    # Sync to browser URL query params
+    encoded_tokens = ""
     try:
         encoded_tokens = base64.urlsafe_b64encode(
             json.dumps(tokens, separators=(",", ":")).encode("utf-8")
@@ -129,6 +150,18 @@ def save_token_to_disk(identifier: str, token: str):
         st.query_params["tokens"] = encoded_tokens
     except Exception:
         pass
+
+    # Sync to browser persistent localStorage
+    if encoded_tokens:
+        components.html(
+            f"""
+            <script>
+                localStorage.setItem('rera_doc_tokens', '{encoded_tokens}');
+            </script>
+            """,
+            height=0,
+            width=0,
+        )
 
 
 # --- Request Helpers --- #
@@ -207,7 +240,7 @@ def fetch_tahasils(district_id: int):
     return []
 
 
-# --- PDF Downloader & Decryptor (Uncached to ensure instant token updates) --- #
+# --- PDF Downloader & Decryptor (Uncached to ensure instant updates) --- #
 def fetch_pdf_bytes(file_id_or_name: str | int, token_override: str = ""):
     if not file_id_or_name:
         return None
@@ -412,7 +445,7 @@ def extract_all_documents(p_info: dict, sub_data: dict):
     for ov_doc in overview_docs:
         add_doc(ov_doc["Document Name"], ov_doc["Identifier"], ov_doc["Source"])
 
-    # Facility Documents (Electricity NOC, Water Supply NOC, etc.)
+    # Facility Documents
     if isinstance(fac_list, list):
         for fac in fac_list:
             if fac.get("documentId") and fac["documentId"] != 0:
@@ -437,7 +470,6 @@ def extract_all_documents(p_info: dict, sub_data: dict):
         if plot.get("shareAllocId") and plot.get("shareAllocId") != 0:
             add_doc(f"Share Allocation - Plot {plot_no}", plot["shareAllocId"], f"Plot {plot_no}")
 
-        # Land Owner Share Documents
         for o in plot.get("owners", []):
             if o.get("fileId") and o["fileId"] != 0:
                 add_doc(f"Owner Share Document - {o.get('name', 'Owner')}", o["fileId"], f"Plot {plot_no}")
@@ -532,7 +564,6 @@ def render_documents_manager(docs_list: list, unique_key_prefix: str):
 
     saved_tokens = load_saved_tokens()
 
-    # Pre-sync document tokens with cache and session state
     for doc in docs_list:
         ident = str(doc["Identifier"]).strip()
         state_key = f"tok_{unique_key_prefix}_{ident}"
@@ -584,7 +615,6 @@ def render_documents_manager(docs_list: list, unique_key_prefix: str):
                 label_visibility="collapsed",
             )
 
-            # Persist token to disk and browser query parameters immediately on edit
             if token_input.strip() and token_input.strip() != current_token:
                 clean_tok = token_input.strip()
                 save_token_to_disk(identifier, clean_tok)
@@ -1083,7 +1113,6 @@ else:
                     investor_fund = fund_data.get("fromInvestors", "0.00")
                     est_doc_id = fund_data.get("estimationCopyId")
 
-                    # Highlight Metrics
                     c1, c2, c3 = st.columns(3)
                     with c1:
                         st.metric("Estimated Project Cost", f"₹ {est_cost} Lakhs")
@@ -1094,7 +1123,6 @@ else:
 
                     st.markdown("---")
 
-                    # Structured Table
                     fin_df = pd.DataFrame([
                         {"Financial Component": "Estimated Project Cost", "Amount (₹ in Lakhs)": est_cost},
                         {"Financial Component": "Fund to be invested by promoter from own source", "Amount (₹ in Lakhs)": promoter_fund},
@@ -1104,7 +1132,6 @@ else:
                     ])
                     st.dataframe(fin_df, use_container_width=True, hide_index=True)
 
-                    # Estimate Copy Document Token Manager
                     if est_doc_id:
                         st.markdown("##### 📄 Estimate Copy Attachment")
                         saved_tokens = load_saved_tokens()
